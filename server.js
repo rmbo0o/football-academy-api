@@ -25,11 +25,40 @@ function initializeDatabase() {
         db.run(`CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, email TEXT UNIQUE, password TEXT, role TEXT)`);
         db.run(`CREATE TABLE IF NOT EXISTS players (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, birth_date TEXT NOT NULL, parent_phone TEXT NOT NULL, relative_relation TEXT, relative_phone TEXT, member_number TEXT, height REAL, weight REAL, allergies TEXT, chronic_diseases TEXT, past_injuries TEXT, current_medications TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
         db.run(`CREATE TABLE IF NOT EXISTS sports (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL)`);
-        db.run(`CREATE TABLE IF NOT EXISTS packages (id INTEGER PRIMARY KEY AUTOINCREMENT, sport_id INTEGER NOT NULL, name TEXT NOT NULL, days TEXT NOT NULL, session_time TEXT NOT NULL, FOREIGN KEY(sport_id) REFERENCES sports(id))`);
-        db.run(`CREATE TABLE IF NOT EXISTS package_durations (id INTEGER PRIMARY KEY AUTOINCREMENT, package_id INTEGER NOT NULL, months INTEGER NOT NULL, price REAL NOT NULL, is_active INTEGER DEFAULT 0, FOREIGN KEY(package_id) REFERENCES packages(id))`);
         
-        // جدول الاشتراكات المربوط بـ duration_id لمعرفة الشهر والسعر المختار
+        // جدول الباقات بعد دمج الحقل الجديد وحذف التكرار العشوائي
+        db.run(`CREATE TABLE IF NOT EXISTS packages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, 
+            sport_id INTEGER NOT NULL, 
+            name TEXT NOT NULL, 
+            days TEXT NOT NULL, 
+            session_time TEXT NOT NULL, 
+            max_subscribers INTEGER DEFAULT 0, 
+            FOREIGN KEY(sport_id) REFERENCES sports(id)
+        )`);
+        
+        db.run(`CREATE TABLE IF NOT EXISTS package_durations (id INTEGER PRIMARY KEY AUTOINCREMENT, package_id INTEGER NOT NULL, months INTEGER NOT NULL, price REAL NOT NULL, is_active INTEGER DEFAULT 0, FOREIGN KEY(package_id) REFERENCES packages(id))`);
         db.run(`CREATE TABLE IF NOT EXISTS subscriptions (id INTEGER PRIMARY KEY AUTOINCREMENT, player_id INTEGER NOT NULL, duration_id INTEGER NOT NULL, start_date TEXT NOT NULL, end_date TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(player_id) REFERENCES players(id), FOREIGN KEY(duration_id) REFERENCES package_durations(id))`);
+        
+        // 📝 إضافة جدول الحضور والغياب الجديد
+        db.run(`CREATE TABLE IF NOT EXISTS attendance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id INTEGER NOT NULL,
+            package_id INTEGER NOT NULL,
+            date TEXT NOT NULL,
+            status TEXT NOT NULL, -- 'present' أو 'absent'
+            FOREIGN KEY(player_id) REFERENCES players(id),
+            FOREIGN KEY(package_id) REFERENCES packages(id)
+        )`);
+
+        // 🚀 زرع حساب المدير الافتراضي مشفراً إذا كان الجدول فارغاً (حل مشكلة الدخول 401)
+        db.get("SELECT COUNT(*) as count FROM users", (err, row) => {
+            if (row && row.count === 0) {
+                const hashedPassword = bcrypt.hashSync('password', 10);
+                db.run("INSERT INTO users (name, email, password, role) VALUES (?, ?, ?, ?)", ['المدير العام', 'admin@academy.com', hashedPassword, 'admin']);
+                console.log('💡 تم إنشاء حساب المدير الافتراضي بنجاح (admin@academy.com).');
+            }
+        });
 
         db.get("SELECT COUNT(*) as count FROM sports", (err, row) => {
             if (row && row.count === 0) {
@@ -53,7 +82,6 @@ function verifyToken(req, res, next) {
     } else { res.status(401).json({ message: 'غير مسموح بالدخول' }); }
 }
 
-// [إصلاح خطأ الـ Dashboard] - إرجاع بيانات لوحة التحكم
 app.get('/api/dashboard/data', verifyToken, (req, res) => {
     res.json({ name: req.user.name, role: req.user.role, secretData: req.user.role === 'admin' ? "🔒 أرباحك 5000$" : "📋 لديك حصتين اليوم" });
 });
@@ -84,24 +112,22 @@ app.get('/api/sports', verifyToken, (req, res) => {
     db.all("SELECT * FROM sports", [], (err, rows) => { res.json(rows); });
 });
 
-// رابط حفظ الباقة الكاملة (محدث ليدعم إدخال اسم الرياضة يدوياً)
+// استقبال وحفظ الباقة مع الحد الأقصى للمشتركين
 app.post('/api/packages', verifyToken, (req, res) => {
     if (req.user.role !== 'admin') return res.status(403).json({ message: 'عذراً، هذه الصلاحية خاصة بالمدير العام فقط!' });
     
-    const { sport_name, name, days, session_time, durations } = req.body;
+    const { sport_name, name, days, session_time, durations, max_subscribers } = req.body;
 
     if (!sport_name || !name || !days || !session_time) {
         return res.status(400).json({ message: 'الرجاء التأكد من إدخال كافة البيانات الأساسية' });
     }
 
-    // 1. الفحص التلقائي: هل الرياضة موجودة مسبقاً في الجدول؟
     db.get("SELECT id FROM sports WHERE name = ?", [sport_name.trim()], (err, row) => {
         if (err) return res.status(500).json({ message: 'خطأ في فحص الرياضة' });
 
-        // دالة مساعدة لإدخال الباقة بعد معرفة الـ sport_id
         const insertPackageAndDurations = (sportId) => {
-            const packageSql = `INSERT INTO packages (sport_id, name, days, session_time) VALUES (?, ?, ?, ?)`;
-            db.run(packageSql, [sportId, name, days, session_time], function(err) {
+            const packageSql = `INSERT INTO packages (sport_id, name, days, session_time, max_subscribers) VALUES (?, ?, ?, ?, ?)`;
+            db.run(packageSql, [sportId, name, days, session_time, max_subscribers || 0], function(err) {
                 if (err) return res.status(500).json({ message: 'حدث خطأ أثناء حفظ الباقة الأساسية' });
 
                 const packageId = this.lastID;
@@ -120,19 +146,16 @@ app.post('/api/packages', verifyToken, (req, res) => {
         };
 
         if (row) {
-            // إذا كانت الرياضة موجودة، نستخدم الـ ID الخاص بها مباشرة
             insertPackageAndDurations(row.id);
         } else {
-            // إذا كانت الرياضة جديدة، نقوم بإدخالها أولاً في جدول الرياضات
             db.run("INSERT INTO sports (name) VALUES (?)", [sport_name.trim()], function(err) {
                 if (err) return res.status(500).json({ message: 'خطأ في إنشاء الرياضة الجديدة' });
-                insertPackageAndDurations(this.lastID); // نمرر الـ ID الجديد للرياضة المنشأة
+                insertPackageAndDurations(this.lastID);
             });
         }
     });
 });
 
-// [رابط جديد للمشتركين] - يجلب الباقات المفعلة فقط مع الرياضة والأشهر التابعة لها
 app.get('/api/active-packages', verifyToken, (req, res) => {
     const sql = `
         SELECT pd.id AS duration_id, s.name AS sport_name, p.name AS package_name, pd.months, pd.price
@@ -148,7 +171,6 @@ app.get('/api/active-packages', verifyToken, (req, res) => {
     });
 });
 
-// رابط تفعيل اشتراك لاعب جديد
 app.post('/api/subscriptions', verifyToken, (req, res) => {
     const { player_id, duration_id, start_date, end_date } = req.body;
     db.run(`INSERT INTO subscriptions (player_id, duration_id, start_date, end_date) VALUES (?, ?, ?, ?)`, [player_id, duration_id, start_date, end_date], function(err) {
@@ -158,5 +180,63 @@ app.post('/api/subscriptions', verifyToken, (req, res) => {
 });
 
 
+// 🔔 =========================================================
+// 🚀 روابط ميزة الحضور والغياب المضافة حديثاً
+// 🔔 =========================================================
+
+// 1. جلب قائمة كل الباقات المتاحة مع اسم الرياضة الخاص بها لتسهيل الاختيار في صفحة الحضور
+app.get('/api/packages-list', verifyToken, (req, res) => {
+    const sql = `
+        SELECT p.id, p.name AS package_name, s.name AS sport_name 
+        FROM packages p
+        JOIN sports s ON p.sport_id = s.id
+    `;
+    db.all(sql, [], (err, rows) => {
+        if (err) return res.status(500).json({ message: 'خطأ في جلب قائمة الباقات' });
+        res.json(rows);
+    });
+});
+
+// 2. جلب اللاعبين المشتركين حالياً في باقة معينة بناءً على كود الباقة
+app.get('/api/packages/:id/players', verifyToken, (req, res) => {
+    const packageId = req.params.id;
+    const sql = `
+        SELECT DISTINCT pl.id, pl.name, pl.parent_phone, pl.member_number
+        FROM players pl
+        JOIN subscriptions sub ON pl.id = sub.player_id
+        JOIN package_durations pd ON sub.duration_id = pd.id
+        WHERE pd.package_id = ?
+    `;
+    db.all(sql, [packageId], (err, rows) => {
+        if (err) return res.status(500).json({ message: 'خطأ في جلب لاعبي الباقة' });
+        res.json(rows);
+    });
+});
+
+// 3. حفظ كشف الحضور والغياب اليومي (تحديث أو إضافة جماعية)
+app.post('/api/attendance', verifyToken, (req, res) => {
+    const { package_id, date, attendance_list } = req.body;
+
+    if (!package_id || !date || !attendance_list || attendance_list.length === 0) {
+        return res.status(400).json({ message: 'البيانات المرسلة غير مكتملة' });
+    }
+
+    db.serialize(() => {
+        // حذف التحضير القديم لنفس اليوم ونفس الباقة لتجنب التكرار عند إعادة الحفظ
+        db.run(`DELETE FROM attendance WHERE package_id = ? AND date = ?`, [package_id, date]);
+
+        const sql = `INSERT INTO attendance (player_id, package_id, date, status) VALUES (?, ?, ?, ?)`;
+        const stmt = db.prepare(sql);
+
+        attendance_list.forEach(item => {
+            stmt.run(item.player_id, package_id, date, item.status);
+        });
+
+        stmt.finalize((err) => {
+            if (err) return res.status(500).json({ message: 'خطأ أثناء حفظ كشف التحضير' });
+            res.json({ message: '✅ تم حفظ كشف الحضور والغياب بنجاح!' });
+        });
+    });
+});
 
 app.listen(5000, () => console.log('السيرفر يعمل على بورت 5000'));
