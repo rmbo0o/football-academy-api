@@ -128,6 +128,11 @@ function initializeDatabase() {
             // تجاهل الخطأ إذا كان العمود مضافاً مسبقاً
         });
 
+        // ترقية جدول الباقات لربطه بالمدرب المسؤول تلقائياً
+        db.run(`ALTER TABLE packages ADD COLUMN coach_id INTEGER`, (err) => {
+            // تجاهل الخطأ إذا كان العمود مضافاً مسبقاً
+        });
+
         db.get("SELECT COUNT(*) as count FROM users", (err, row) => {
             if (row && row.count === 0) {
                 const hashedPassword = bcrypt.hashSync('password', 10);
@@ -292,7 +297,7 @@ app.get('/api/sports', verifyToken, (req, res) => {
 
 app.post('/api/packages', verifyToken, (req, res) => {
     if (req.user.role !== 'admin') return res.status(403).json({ message: 'عذراً، هذه الصلاحية خاصة بالمدير العام فقط!' });
-    const { sport_name, name, days, session_time, durations, max_subscribers } = req.body;
+    const { sport_name, name, days, session_time, durations, max_subscribers, coach_id } = req.body;
 
     if (!sport_name || !name || !days || !session_time) {
         return res.status(400).json({ message: 'الرجاء التأكد من إدخال كافة البيانات الأساسية' });
@@ -302,8 +307,8 @@ app.post('/api/packages', verifyToken, (req, res) => {
         if (err) return res.status(500).json({ message: 'خطأ في فحص الرياضة' });
 
         const insertPackageAndDurations = (sportId) => {
-            const packageSql = `INSERT INTO packages (sport_id, name, days, session_time, max_subscribers) VALUES (?, ?, ?, ?, ?)`;
-            db.run(packageSql, [sportId, name, days, session_time, max_subscribers || 0], function(err) {
+            const packageSql = `INSERT INTO packages (sport_id, name, days, session_time, max_subscribers, coach_id) VALUES (?, ?, ?, ?, ?, ?)`;
+            db.run(packageSql, [sportId, name, days, session_time, max_subscribers || 0, coach_id || null], function(err) {
                 if (err) return res.status(500).json({ message: 'حدث خطأ أثناء حفظ الباقة الأساسية' });
 
                 const packageId = this.lastID;
@@ -404,9 +409,10 @@ app.put('/api/subscriptions/:id', verifyToken, (req, res) => {
 // جلب قائمة الباقات المتاحة مع تفاصيل الأيام والوقت للتوليد التلقائي للحصص
 app.get('/api/packages-list', verifyToken, (req, res) => {
     const sql = `
-        SELECT p.id, p.name AS package_name, s.name AS sport_name, p.days, p.session_time, p.max_subscribers
+        SELECT p.id, p.name AS package_name, s.name AS sport_name, p.days, p.session_time, p.max_subscribers, p.coach_id, u.name AS coach_name
         FROM packages p
         JOIN sports s ON p.sport_id = s.id
+        LEFT JOIN users u ON p.coach_id = u.id
     `;
     db.all(sql, [], (err, rows) => {
         if (err) return res.status(500).json({ message: 'خطأ في جلب قائمة الباقات' });
@@ -437,14 +443,14 @@ app.get('/api/packages/:id', verifyToken, (req, res) => {
 app.put('/api/packages/:id', verifyToken, (req, res) => {
     if (req.user.role !== 'admin') return res.status(403).json({ message: 'عذراً، هذه الصلاحية خاصة بالمدير العام فقط!' });
     const packageId = req.params.id;
-    const { sport_name, name, days, session_time, max_subscribers, durations } = req.body;
+    const { sport_name, name, days, session_time, max_subscribers, durations, coach_id } = req.body;
 
     db.get("SELECT id FROM sports WHERE name = ?", [sport_name.trim()], (err, sportRow) => {
         if (err) return res.status(500).json({ message: 'خطأ في فحص الرياضة' });
 
         const updatePackage = (sportId) => {
-            const sql = `UPDATE packages SET sport_id = ?, name = ?, days = ?, session_time = ?, max_subscribers = ? WHERE id = ?`;
-            db.run(sql, [sportId, name, days, session_time, max_subscribers || 0, packageId], function(err) {
+            const sql = `UPDATE packages SET sport_id = ?, name = ?, days = ?, session_time = ?, max_subscribers = ?, coach_id = ? WHERE id = ?`;
+            db.run(sql, [sportId, name, days, session_time, max_subscribers || 0, coach_id || null, packageId], function(err) {
                 if (err) return res.status(500).json({ message: 'خطأ أثناء تعديل الباقة' });
 
                 if (durations && durations.length > 0) {
@@ -536,6 +542,26 @@ app.get('/api/branches/:id/players', verifyToken, (req, res) => {
     db.all("SELECT id, name, member_number, parent_phone FROM players WHERE branch_id = ? ORDER BY name ASC", [branchId], (err, rows) => {
         if (err) return res.status(500).json({ message: 'خطأ في جلب لاعبي الفرع' });
         res.json(rows);
+    });
+});
+
+// ملخص بيانات فرع محدد للوحة التحكم
+app.get('/api/branches/:id/summary', verifyToken, (req, res) => {
+    const branchId = req.params.id;
+    const sql = `
+        SELECT 
+            (SELECT COUNT(*) FROM players WHERE branch_id = ?) AS total_players,
+            (SELECT COUNT(DISTINCT sub.id) FROM subscriptions sub
+             JOIN players p ON sub.player_id = p.id
+             WHERE p.branch_id = ? AND sub.end_date >= date('now')) AS total_subscriptions,
+            (SELECT COALESCE(SUM(pd.price), 0) FROM subscriptions sub
+             JOIN package_durations pd ON sub.duration_id = pd.id
+             JOIN players p ON sub.player_id = p.id
+             WHERE p.branch_id = ?) AS total_revenue
+    `;
+    db.get(sql, [branchId, branchId, branchId], (err, row) => {
+        if (err) return res.status(500).json({ message: 'خطأ في جلب ملخص الفرع' });
+        res.json(row || { total_players: 0, total_subscriptions: 0, total_revenue: 0 });
     });
 });
 
@@ -654,20 +680,24 @@ app.get('/api/coaches', verifyToken, (req, res) => {
     });
 });
 
-// 2. إنشاء حصة تدريبية جديدة (ربط باقة بمدرب)
+// 2. إنشاء حصة تدريبية جديدة (المدرب يُؤخذ تلقائياً من الباقة)
 app.post('/api/sessions', verifyToken, (req, res) => {
-    const { package_id, coach_id, branch_id } = req.body;
-    if (!package_id || !coach_id) {
-        return res.status(400).json({ message: "يرجى تحديد الباقة والمدرب الكابتن الحصة." });
+    const { package_id, branch_id } = req.body;
+    if (!package_id) {
+        return res.status(400).json({ message: "يرجى تحديد الباقة." });
     }
-    db.run(
-        "INSERT INTO sessions (package_id, coach_id, branch_id) VALUES (?, ?, ?)", 
-        [package_id, coach_id, branch_id || null], 
-        function(err) {
-            if (err) return res.status(500).json({ error: err.message });
-            res.json({ message: "تم تسجيل الحصة التدريبية بنجاح! ⚽", sessionId: this.lastID });
-        }
-    );
+    db.get("SELECT coach_id FROM packages WHERE id = ?", [package_id], (err, pkg) => {
+        if (err) return res.status(500).json({ error: err.message });
+        const coach_id = (pkg && pkg.coach_id) || null;
+        db.run(
+            "INSERT INTO sessions (package_id, coach_id, branch_id) VALUES (?, ?, ?)", 
+            [package_id, coach_id, branch_id || null], 
+            function(err2) {
+                if (err2) return res.status(500).json({ error: err2.message });
+                res.json({ message: "تم تسجيل الحصة التدريبية بنجاح! ⚽", sessionId: this.lastID });
+            }
+        );
+    });
 });
 
 // 3. جلب جدول الحصص الأسبوعية المؤتمت مع دمج بيانات الباقة وتفكيك الوقت بدقة
@@ -693,7 +723,7 @@ app.get('/api/sessions', verifyToken, (req, res) => {
         FROM sessions s
         JOIN packages p ON s.package_id = p.id
         JOIN sports sp ON p.sport_id = sp.id
-        JOIN users u ON s.coach_id = u.id
+        LEFT JOIN users u ON s.coach_id = u.id
     `;
     db.all(sql, [], (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
@@ -707,7 +737,7 @@ app.get('/api/sessions', verifyToken, (req, res) => {
                 coach_id: row.coach_id,
                 branch_id: row.branch_id,
                 title: `${row.sport_name} - ${row.package_name}`,
-                coach_name: row.coach_name,
+                coach_name: row.coach_name || 'غير محدد',
                 day_of_week: row.day_of_week,
                 start_time: times[0] ? times[0].trim() : row.session_time,
                 end_time: times[1] ? times[1].trim() : '',
