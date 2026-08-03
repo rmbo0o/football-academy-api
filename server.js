@@ -680,6 +680,28 @@ app.get('/api/coaches', verifyToken, (req, res) => {
     });
 });
 
+// إضافة حساب مدرب جديد (مدير النظام فقط)
+app.post('/api/users', verifyToken, (req, res) => {
+    if (req.user.role !== 'admin') return res.status(403).json({ message: 'صلاحية خاصة بالمدير العام فقط!' });
+    const { name, email, password, role } = req.body;
+
+    if (!name || !email || !password) {
+        return res.status(400).json({ message: 'الرجاء إدخال الاسم والبريد الإلكتروني وكلمة المرور.' });
+    }
+
+    const userRole = (role === 'coach' || role === 'branch_manager') ? role : 'coach';
+    const hashedPassword = bcrypt.hashSync(password, 10);
+
+    db.run(
+        "INSERT INTO users (name, email, password, role) VALUES (?, ?, ?, ?)",
+        [name.trim(), email.trim().toLowerCase(), hashedPassword, userRole],
+        function(err) {
+            if (err) return res.status(500).json({ message: 'خطأ في إنشاء الحساب، قد يكون البريد الإلكتروني مستخدماً مسبقاً.' });
+            res.json({ message: '✅ تم إنشاء حساب المدرب بنجاح!', id: this.lastID });
+        }
+    );
+});
+
 // 2. إنشاء حصة تدريبية جديدة (المدرب يُؤخذ تلقائياً من الباقة)
 app.post('/api/sessions', verifyToken, (req, res) => {
     const { package_id, branch_id } = req.body;
