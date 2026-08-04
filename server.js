@@ -1,9 +1,8 @@
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
+const mysql = require('mysql2');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
-const path = require('path');
 require('dotenv').config();
 
 const app = express();
@@ -12,161 +11,158 @@ app.use(cors());
 
 const JWT_SECRET = process.env.JWT_SECRET || 'my_super_secret_key_123';
 const PORT = process.env.PORT || 5000;
-const dbPath = path.resolve(__dirname, process.env.DB_PATH || 'football_academy.db');
 
-const db = new sqlite3.Database(dbPath, (err) => {
-    if (err) console.error(err.message);
-    else {
-        console.log('تم الاتصال بقاعدة بيانات SQLite بنجاح.');
-        initializeDatabase();
-    }
+const pool = mysql.createPool({
+    host: process.env.DB_HOST || 'localhost',
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD || '',
+    database: process.env.DB_NAME || 'football_academy',
+    port: process.env.DB_PORT ? parseInt(process.env.DB_PORT) : 3306,
+    connectionLimit: 1,
+    waitForConnections: true,
+    decimalNumbers: true,
+    charset: 'utf8mb4'
 });
+
+// واجهة مبسطة تحاكي طريقة عمل SQLite لتقليل التعديلات على بقية الكود
+const db = {
+    all(sql, params, callback) {
+        if (typeof params === 'function') { callback = params; params = []; }
+        if (!callback) callback = () => {};
+        pool.query(sql, params, (err, rows) => {
+            if (err) return callback(err);
+            callback(null, rows);
+        });
+    },
+    get(sql, params, callback) {
+        if (typeof params === 'function') { callback = params; params = []; }
+        if (!callback) callback = () => {};
+        pool.query(sql, params, (err, rows) => {
+            if (err) return callback(err);
+            callback(null, rows[0]);
+        });
+    },
+    run(sql, params, callback) {
+        if (typeof params === 'function') { callback = params; params = []; }
+        if (!callback) callback = () => {};
+        pool.query(sql, params, (err, result) => {
+            if (err) return callback(err);
+            callback.call({ lastID: result.insertId, changes: result.affectedRows }, null);
+        });
+    },
+    serialize(fn) { fn(); },
+    prepare(sql) {
+        let chain = Promise.resolve();
+        return {
+            run: (...args) => {
+                chain = chain.then(() => new Promise((resolve, reject) => {
+                    pool.query(sql, args, (err) => err ? reject(err) : resolve());
+                }));
+            },
+            finalize: (cb) => {
+                chain.then(() => cb && cb(null)).catch((err) => cb && cb(err));
+            }
+        };
+    }
+};
+
+pool.query('SELECT 1', (err) => {
+    if (err) {
+        console.error('فشل الاتصال بقاعدة بيانات MySQL:', err.message);
+        process.exit(1);
+    }
+    console.log('تم الاتصال بقاعدة بيانات MySQL بنجاح.');
+    initializeDatabase();
+});
+
+function ensureColumn(table, column, definition) {
+    db.all("SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?", [table, column], (err, rows) => {
+        if (err) { console.error('فحص أعمدة الجدول فشل:', err.message); return; }
+        if (!rows || rows.length === 0) {
+            db.run(`ALTER TABLE ${table} ADD COLUMN ${definition}`, (alterErr) => {
+                if (alterErr) console.error(`إضافة العمود ${column} إلى جدول ${table} فشلت:`, alterErr.message);
+            });
+        }
+    });
+}
 
 function initializeDatabase() {
     db.serialize(() => {
-        db.run(`CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, email TEXT UNIQUE, password TEXT, role TEXT)`);
-        db.run(`CREATE TABLE IF NOT EXISTS players (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, birth_date TEXT NOT NULL, parent_phone TEXT NOT NULL, relative_relation TEXT, relative_phone TEXT, member_number TEXT, height REAL, weight REAL, allergies TEXT, chronic_diseases TEXT, past_injuries TEXT, current_medications TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`);
-        db.run(`CREATE TABLE IF NOT EXISTS sports (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL)`);
-        
-        db.run(`CREATE TABLE IF NOT EXISTS packages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, 
-            sport_id INTEGER NOT NULL, 
-            name TEXT NOT NULL, 
-            days TEXT NOT NULL, 
-            session_time TEXT NOT NULL, 
-            max_subscribers INTEGER DEFAULT 0, 
-            FOREIGN KEY(sport_id) REFERENCES sports(id)
-        )`);
-        
-        db.run(`CREATE TABLE IF NOT EXISTS package_durations (id INTEGER PRIMARY KEY AUTOINCREMENT, package_id INTEGER NOT NULL, months INTEGER NOT NULL, price REAL NOT NULL, is_active INTEGER DEFAULT 0, FOREIGN KEY(package_id) REFERENCES packages(id))`);
-        db.run(`CREATE TABLE IF NOT EXISTS subscriptions (id INTEGER PRIMARY KEY AUTOINCREMENT, player_id INTEGER NOT NULL, duration_id INTEGER NOT NULL, start_date TEXT NOT NULL, end_date TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(player_id) REFERENCES players(id), FOREIGN KEY(duration_id) REFERENCES package_durations(id))`);
-        db.run(`CREATE TABLE IF NOT EXISTS attendance (id INTEGER PRIMARY KEY AUTOINCREMENT, player_id INTEGER NOT NULL, package_id INTEGER NOT NULL, date TEXT NOT NULL, status TEXT NOT NULL, FOREIGN KEY(player_id) REFERENCES players(id), FOREIGN KEY(package_id) REFERENCES packages(id))`);
-
+        db.run(`CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTO_INCREMENT, name VARCHAR(191), email VARCHAR(191) UNIQUE, password TEXT, role VARCHAR(50), branch_id INTEGER, permissions TEXT)`, [], (err) => { if (err) console.error(err.message); });
         db.run(`CREATE TABLE IF NOT EXISTS branches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            city TEXT NOT NULL,
+            id INTEGER PRIMARY KEY AUTO_INCREMENT,
+            name VARCHAR(191) UNIQUE NOT NULL,
+            city VARCHAR(191) NOT NULL,
             address TEXT,
             phone TEXT,
             manager TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )`);
-
-        db.run(`CREATE TABLE IF NOT EXISTS refunds (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            player_id INTEGER NOT NULL,
-            amount REAL NOT NULL,
-            date TEXT NOT NULL,
-            reason TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(player_id) REFERENCES players(id)
-        )`);
-
-
-        db.run(`CREATE TABLE IF NOT EXISTS holidays (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT,
-            start_date TEXT,
-            days_count INTEGER
-            )`);
-
-            db.run(`CREATE TABLE IF NOT EXISTS player_evaluations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            player_id INTEGER,
+        )`, [], (err) => { if (err) console.error(err.message); });
+        db.run(`CREATE TABLE IF NOT EXISTS sports (id INTEGER PRIMARY KEY AUTO_INCREMENT, name VARCHAR(191) UNIQUE NOT NULL)`, [], (err) => { if (err) console.error(err.message); });
+        db.run(`CREATE TABLE IF NOT EXISTS packages (
+            id INTEGER PRIMARY KEY AUTO_INCREMENT,
+            sport_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            days TEXT NOT NULL,
+            session_time TEXT NOT NULL,
+            max_subscribers INTEGER DEFAULT 0,
             coach_id INTEGER,
-            month TEXT,
-            passing_score INTEGER,
-            shooting_score INTEGER,
-            running_score INTEGER,
-            notes TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )`);
+            branch_id INTEGER,
+            FOREIGN KEY(sport_id) REFERENCES sports(id)
+        )`, [], (err) => { if (err) console.error(err.message); });
+        db.run(`CREATE TABLE IF NOT EXISTS package_durations (id INTEGER PRIMARY KEY AUTO_INCREMENT, package_id INTEGER NOT NULL, months INTEGER NOT NULL, price REAL NOT NULL, is_active INTEGER DEFAULT 0, FOREIGN KEY(package_id) REFERENCES packages(id))`, [], (err) => { if (err) console.error(err.message); });
+        db.run(`CREATE TABLE IF NOT EXISTS players (id INTEGER PRIMARY KEY AUTO_INCREMENT, name TEXT NOT NULL, birth_date TEXT NOT NULL, parent_phone TEXT NOT NULL, relative_relation TEXT, relative_phone TEXT, member_number TEXT, height REAL, weight REAL, allergies TEXT, chronic_diseases TEXT, past_injuries TEXT, current_medications TEXT, branch_id INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`, [], (err) => { if (err) console.error(err.message); });
+        db.run(`CREATE TABLE IF NOT EXISTS subscriptions (id INTEGER PRIMARY KEY AUTO_INCREMENT, player_id INTEGER NOT NULL, duration_id INTEGER NOT NULL, start_date TEXT NOT NULL, end_date TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(player_id) REFERENCES players(id), FOREIGN KEY(duration_id) REFERENCES package_durations(id))`, [], (err) => { if (err) console.error(err.message); });
+        db.run(`CREATE TABLE IF NOT EXISTS attendance (id INTEGER PRIMARY KEY AUTO_INCREMENT, player_id INTEGER NOT NULL, package_id INTEGER NOT NULL, date TEXT NOT NULL, status TEXT NOT NULL, FOREIGN KEY(player_id) REFERENCES players(id), FOREIGN KEY(package_id) REFERENCES packages(id))`, [], (err) => { if (err) console.error(err.message); });
+        db.run(`CREATE TABLE IF NOT EXISTS refunds (id INTEGER PRIMARY KEY AUTO_INCREMENT, player_id INTEGER NOT NULL, amount REAL NOT NULL, date TEXT NOT NULL, reason TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(player_id) REFERENCES players(id))`, [], (err) => { if (err) console.error(err.message); });
+        db.run(`CREATE TABLE IF NOT EXISTS holidays (id INTEGER PRIMARY KEY AUTO_INCREMENT, title TEXT, start_date TEXT, days_count INTEGER)`, [], (err) => { if (err) console.error(err.message); });
+        db.run(`CREATE TABLE IF NOT EXISTS player_evaluations (id INTEGER PRIMARY KEY AUTO_INCREMENT, player_id INTEGER, coach_id INTEGER, month TEXT, passing_score INTEGER, shooting_score INTEGER, running_score INTEGER, notes TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`, [], (err) => { if (err) console.error(err.message); });
 
-        // 🔄 فحص ترقية جدول الحصص تلقائياً وتفعيل الهيكلية الذكية الجديدة
-        db.all("PRAGMA table_info(sessions)", [], (err, rows) => {
-            if (err) return console.error(err.message);
-            
-            const hasPackageId = rows && rows.some(r => r.name === 'package_id');
-            if (!hasPackageId) {
-                db.serialize(() => {
-                    db.run(`DROP TABLE IF EXISTS session_players`);
-                    db.run(`DROP TABLE IF EXISTS session_attendance`);
-                    db.run(`DROP TABLE IF EXISTS sessions`);
+        // الحصص مرتبطة بالباقة والمدرب والفرع مباشرة (coach_id قابل للإلغاء)
+        db.run(`CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTO_INCREMENT,
+            package_id INTEGER NOT NULL,
+            coach_id INTEGER,
+            branch_id INTEGER,
+            FOREIGN KEY(package_id) REFERENCES packages(id) ON DELETE CASCADE,
+            FOREIGN KEY(coach_id) REFERENCES users(id) ON DELETE SET NULL,
+            FOREIGN KEY(branch_id) REFERENCES branches(id) ON DELETE SET NULL
+        )`, [], (err) => { if (err) console.error(err.message); });
 
-                    // الحصص الجديدة مرتبطة بالباقة والمدرب مباشرة
-                    db.run(`
-                        CREATE TABLE sessions (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            package_id INTEGER NOT NULL,
-                            coach_id INTEGER NOT NULL,
-                            branch_id INTEGER,
-                            FOREIGN KEY(package_id) REFERENCES packages(id) ON DELETE CASCADE,
-                            FOREIGN KEY(coach_id) REFERENCES users(id) ON DELETE CASCADE,
-                            FOREIGN KEY(branch_id) REFERENCES branches(id) ON DELETE SET NULL
-                        )
-                    `);
+        // جدول التحضير للحصص
+        db.run(`CREATE TABLE IF NOT EXISTS session_attendance (
+            id INTEGER PRIMARY KEY AUTO_INCREMENT,
+            session_id INTEGER NOT NULL,
+            player_id INTEGER NOT NULL,
+            date TEXT NOT NULL,
+            status TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+            FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE
+        )`, [], (err) => { if (err) console.error(err.message); });
 
-                    // جدول التحضير للحصص الجديدة
-                    db.run(`
-                        CREATE TABLE session_attendance (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            session_id INTEGER NOT NULL,
-                            player_id INTEGER NOT NULL,
-                            date TEXT NOT NULL,
-                            status TEXT NOT NULL,
-                            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
-                            FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE
-                        )
-                    `);
-                    console.log('🔄 تم تحديث قاعدة البيانات بنجاح لنظام الحصص المترابط تلقائياً!');
-                });
-            }
-        });
+        // التأكد من وجود الأعمدة المضافة في النسخ القديمة
+        ensureColumn('players', 'branch_id', 'INTEGER');
+        ensureColumn('packages', 'coach_id', 'INTEGER');
+        ensureColumn('packages', 'branch_id', 'INTEGER');
+        ensureColumn('users', 'branch_id', 'INTEGER');
+        ensureColumn('users', 'permissions', 'TEXT');
+        ensureColumn('sessions', 'coach_id', 'INTEGER');
+        ensureColumn('sessions', 'branch_id', 'INTEGER');
 
-        // ترقية جدول اللاعبين لربطه بالفروع تلقائياً
-        db.run(`ALTER TABLE players ADD COLUMN branch_id INTEGER`, (err) => {
-            // تجاهل الخطأ إذا كان العمود مضافاً مسبقاً
-        });
-
-        // ترقية جدول الباقات لربطه بالمدرب المسؤول تلقائياً
-        db.run(`ALTER TABLE packages ADD COLUMN coach_id INTEGER`, (err) => {
-            // تجاهل الخطأ إذا كان العمود مضافاً مسبقاً
-        });
-
-        // ترقية الباقات لربطها بالفرع تلقائياً
-        db.run(`ALTER TABLE packages ADD COLUMN branch_id INTEGER`, (err) => {
-            // تجاهل الخطأ إذا كان العمود مضافاً مسبقاً
-        });
-
-        // ترقية جدول المستخدمين لربطه بالفرع وتخزين الصلاحيات تلقائياً
-        db.run(`ALTER TABLE users ADD COLUMN branch_id INTEGER`, (err) => {
-            // تجاهل الخطأ إذا كان العمود مضافاً مسبقاً
-        });
-        db.run(`ALTER TABLE users ADD COLUMN permissions TEXT`, (err) => {
-            // تجاهل الخطأ إذا كان العمود مضافاً مسبقاً
-        });
-
-        db.get("SELECT COUNT(*) as count FROM users", (err, row) => {
-            if (row && row.count === 0) {
+        // إنشاء حساب المدير الافتراضي عند أول تشغيل
+        db.get("SELECT COUNT(*) AS count FROM users", [], (err, row) => {
+            if (!err && row && row.count === 0) {
                 const hashedPassword = bcrypt.hashSync('password', 10);
                 db.run("INSERT INTO users (name, email, password, role) VALUES (?, ?, ?, ?)", ['المدير العام', 'admin@academy.com', hashedPassword, 'admin']);
                 console.log('💡 تم إنشاء حساب المدير الافتراضي بنجاح (admin@academy.com).');
             }
         });
 
-                db.get("SELECT COUNT(*) as count FROM users", (err, row) => {
-            if (row && row.count === 0) {
-                const hashedPassword = bcrypt.hashSync('password', 10);
-                db.run("INSERT INTO users (name, email, password, role) VALUES (?, ?, ?, ?)", ['المدرب', 'coach.ahmed@academy.com', hashedPassword, 'coach']);
-                console.log('💡 تم إنشاء حساب المدرب الافتراضي بنجاح (coach.ahmed@academy.com).');
-            }
-        });
-
-        db.get("SELECT COUNT(*) as count FROM sports", (err, row) => {
-            if (row && row.count === 0) {
-                db.run("INSERT INTO sports (name) VALUES ('كرة القدم')");
-                db.run("INSERT INTO sports (name) VALUES ('سباحة')");
-                db.run("INSERT INTO sports (name) VALUES ('تايكوندو')");
+        db.get("SELECT COUNT(*) AS count FROM sports", [], (err, row) => {
+            if (!err && row && row.count === 0) {
+                db.run("INSERT INTO sports (name) VALUES (?)", ['كرة القدم']);
+                db.run("INSERT INTO sports (name) VALUES (?)", ['سباحة']);
+                db.run("INSERT INTO sports (name) VALUES (?)", ['تايكوندو']);
             }
         });
     });
@@ -352,6 +348,17 @@ app.post('/api/packages', verifyToken, (req, res) => {
 
                 stmt.finalize((finalizeErr) => {
                     if (finalizeErr) return res.status(500).json({ message: 'خطأ في حفظ أسعار الفترات' });
+                    // إنشاء الحصة تلقائياً إذا كانت الباقة مفعلة، ليرى المدرب المسؤول جدوله فوراً
+                    const hasActive = (durations || []).some(d => d.is_active);
+                    if (hasActive) {
+                        db.run("INSERT INTO sessions (package_id, coach_id, branch_id) VALUES (?, ?, ?)",
+                            [packageId, coach_id || null, branchId],
+                            (sErr) => {
+                                if (sErr) console.error('خطأ في إنشاء الحصة تلقائياً:', sErr.message);
+                            }
+                        );
+                        return res.json({ message: '✅ تم إنشاء الباقة وحصتها التدريبية وجدولتها تلقائياً للمدرب المسؤول!' });
+                    }
                     res.json({ message: '✅ تم إنشاء الرياضة والباقة وضبط فترات الأشهر بنجاح للموظفين!' });
                 });
             });
@@ -596,7 +603,7 @@ app.get('/api/branches/:id/summary', verifyToken, (req, res) => {
             (SELECT COUNT(*) FROM players WHERE branch_id = ?) AS total_players,
             (SELECT COUNT(DISTINCT sub.id) FROM subscriptions sub
              JOIN players p ON sub.player_id = p.id
-             WHERE p.branch_id = ? AND sub.end_date >= date('now')) AS total_subscriptions,
+             WHERE p.branch_id = ? AND sub.end_date >= CURDATE()) AS total_subscriptions,
             (SELECT COALESCE(SUM(pd.price), 0) FROM subscriptions sub
              JOIN package_durations pd ON sub.duration_id = pd.id
              JOIN players p ON sub.player_id = p.id
@@ -679,7 +686,7 @@ app.get('/api/reports/summary', verifyToken, (req, res) => {
         FROM subscriptions sub 
         JOIN package_durations pd ON sub.duration_id = pd.id 
         JOIN players p ON sub.player_id = p.id
-        WHERE strftime('%Y-%m', sub.created_at) = strftime('%Y-%m', 'now') ${branchCond}
+        WHERE DATE_FORMAT(sub.created_at, '%Y-%m') = DATE_FORMAT(NOW(), '%Y-%m') ${branchCond}
     `;
     db.get(incomeSql, branchParam, (err, incomeRow) => {
         reportData.totalIncome = (incomeRow && incomeRow.total_income) ? incomeRow.total_income : 0;
@@ -688,7 +695,7 @@ app.get('/api/reports/summary', verifyToken, (req, res) => {
             SELECT SUM(r.amount) as total_refunds 
             FROM refunds r
             JOIN players p ON r.player_id = p.id
-            WHERE strftime('%Y-%m', r.date) = strftime('%Y-%m', 'now') ${branchCond}
+            WHERE DATE_FORMAT(r.date, '%Y-%m') = DATE_FORMAT(NOW(), '%Y-%m') ${branchCond}
         `;
         db.get(refundSql, branchParam, (err, refundRow) => {
             reportData.totalRefunds = (refundRow && refundRow.total_refunds) ? refundRow.total_refunds : 0;
@@ -828,27 +835,41 @@ app.post('/api/sessions', verifyToken, (req, res) => {
     if (!package_id) {
         return res.status(400).json({ message: "يرجى تحديد الباقة." });
     }
-    db.get("SELECT coach_id, branch_id AS pkg_branch FROM packages WHERE id = ?", [package_id], (err, pkg) => {
+    // منع التكرار: الباقة لا تُضاف حصتها أكثر من مرة
+    db.get("SELECT id FROM sessions WHERE package_id = ?", [package_id], (err, existing) => {
         if (err) return res.status(500).json({ error: err.message });
-        const coach_id = (pkg && pkg.coach_id) || null;
-        const finalBranch = (req.user.role === 'branch_manager') ? (req.user.branch_id || null)
-                            : (branch_id || (pkg && pkg.pkg_branch) || null);
-        db.run(
-            "INSERT INTO sessions (package_id, coach_id, branch_id) VALUES (?, ?, ?)", 
-            [package_id, coach_id, finalBranch], 
-            function(err2) {
-                if (err2) return res.status(500).json({ error: err2.message });
-                res.json({ message: "تم تسجيل الحصة التدريبية بنجاح! ⚽", sessionId: this.lastID });
-            }
-        );
+        if (existing) {
+            return res.status(400).json({ message: 'هذه الباقة لديها حصة مسجلة مسبقاً في جدول الحصص.' });
+        }
+        db.get("SELECT coach_id, branch_id AS pkg_branch FROM packages WHERE id = ?", [package_id], (err, pkg) => {
+            if (err) return res.status(500).json({ error: err.message });
+            const coach_id = (pkg && pkg.coach_id) || null;
+            const finalBranch = (req.user.role === 'branch_manager') ? (req.user.branch_id || null)
+                                : (branch_id || (pkg && pkg.pkg_branch) || null);
+            db.run(
+                "INSERT INTO sessions (package_id, coach_id, branch_id) VALUES (?, ?, ?)",
+                [package_id, coach_id, finalBranch],
+                function(err2) {
+                    if (err2) return res.status(500).json({ error: err2.message });
+                    res.json({ message: "تم تسجيل الحصة التدريبية بنجاح! ⚽", sessionId: this.lastID });
+                }
+            );
+        });
     });
 });
 
 // 3. جلب جدول الحصص الأسبوعية المؤتمت مع دمج بيانات الباقة وتفكيك الوقت بدقة
 app.get('/api/sessions', verifyToken, (req, res) => {
     const branchId = getBranchScope(req);
-    const branchFilter = branchId ? ' WHERE s.branch_id = ?' : '';
-    const branchParam = branchId ? [branchId] : [];
+    const where = [];
+    const params = [];
+    if (branchId) { where.push('s.branch_id = ?'); params.push(branchId); }
+    // المدرب يرى حصصه المسؤول عنها فقط
+    if (req.user.role === 'coach' || req.user.role === 'مدرب') {
+        where.push('s.coach_id = ?');
+        params.push(req.user.id);
+    }
+    const whereSql = where.length ? ' WHERE ' + where.join(' AND ') : '';
     const sql = `
         SELECT 
             s.id AS id,
@@ -871,9 +892,9 @@ app.get('/api/sessions', verifyToken, (req, res) => {
         JOIN packages p ON s.package_id = p.id
         JOIN sports sp ON p.sport_id = sp.id
         LEFT JOIN users u ON s.coach_id = u.id
-        ${branchFilter}
+        ${whereSql}
     `;
-    db.all(sql, branchParam, (err, rows) => {
+    db.all(sql, params, (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
         
         // تفكيك تيار الوقت (مثل "17:00 - 18:30") لتأمين التوافق مع قوالب العرض القديمة والجديدة
@@ -898,7 +919,18 @@ app.get('/api/sessions', verifyToken, (req, res) => {
 });
 
 // 4. جلب اللاعبين المشتركين بالباقة تلقائياً (كشف تحضير ديناميكي)
-app.get('/api/sessions/:id/players', verifyToken, (req, res) => {
+// التأكد أن المدرب يصل لحصته المسؤول عنها فقط
+function ensureCoachSessionAccess(req, res, next) {
+    if (req.user.role !== 'coach' && req.user.role !== 'مدرب') return next();
+    db.get("SELECT coach_id FROM sessions WHERE id = ?", [req.params.id], (err, row) => {
+        if (err) return res.status(500).json({ error: err.message });
+        if (!row) return res.status(404).json({ message: 'الحصة غير موجودة' });
+        if (row.coach_id !== req.user.id) return res.status(403).json({ message: 'غير مصرح لك بالوصول لهذه الحصة' });
+        next();
+    });
+}
+
+app.get('/api/sessions/:id/players', verifyToken, ensureCoachSessionAccess, (req, res) => {
     const sessionId = req.params.id;
     const sql = `
         SELECT DISTINCT pl.id, pl.name, pl.member_number
@@ -915,7 +947,7 @@ app.get('/api/sessions/:id/players', verifyToken, (req, res) => {
 });
 
 // 5. جلب حضور حصة معينة في تاريخ محدد
-app.get('/api/sessions/:id/attendance', verifyToken, (req, res) => {
+app.get('/api/sessions/:id/attendance', verifyToken, ensureCoachSessionAccess, (req, res) => {
     const sessionId = req.params.id;
     const { date } = req.query; 
     db.all("SELECT player_id, status FROM session_attendance WHERE session_id = ? AND date = ?", [sessionId, date], (err, rows) => {
@@ -925,7 +957,7 @@ app.get('/api/sessions/:id/attendance', verifyToken, (req, res) => {
 });
 
 // 6. حفظ كشف التحضير الجماعي للحصة في تاريخ معين
-app.post('/api/sessions/:id/attendance', verifyToken, (req, res) => {
+app.post('/api/sessions/:id/attendance', verifyToken, ensureCoachSessionAccess, (req, res) => {
     const sessionId = req.params.id;
     const { date, records } = req.body; 
 
@@ -983,7 +1015,7 @@ app.post('/api/holidays', verifyToken, (req, res) => {
     if (err) return res.status(500).json({ error: err.message });
 
     // تمديد نهاية اشتراك كل اللاعبين الذين تاريخ انتهائهم لم ينتهِ بعد
-    const extendSql = `UPDATE subscriptions SET end_date = date(end_date, '+' || ? || ' days') WHERE end_date >= date('now')`;
+    const extendSql = `UPDATE subscriptions SET end_date = DATE_ADD(end_date, INTERVAL ? DAY) WHERE end_date >= CURDATE()`;
     db.run(extendSql, [days_count], function(err2) {
       if (err2) {
         console.error('خطأ أثناء التمديد التلقائي:', err2);
