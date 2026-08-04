@@ -190,6 +190,15 @@ function getBranchScope(req) {
     return Number.isInteger(b) ? b : null;
 }
 
+// إذا لم يُحدد الفرع فيُعتبر الفرع الأول (الأصغر رقمياً)
+function resolveBranchId(branchId, callback) {
+    if (branchId) return callback(null, parseInt(branchId));
+    db.get("SELECT id FROM branches ORDER BY id ASC LIMIT 1", [], (err, row) => {
+        if (err) return callback(err);
+        callback(null, row ? row.id : null);
+    });
+}
+
 app.get('/api/dashboard/data', verifyToken, (req, res) => {
     res.json({ name: req.user.name, role: req.user.role, secretData: req.user.role === 'admin' ? "🔒 أرباحك 5000$" : "📋 لديك حصتين اليوم" });
 });
@@ -775,21 +784,32 @@ app.put('/api/users/:id', verifyToken, (req, res) => {
         if (!validRoles.includes(role)) return res.status(400).json({ message: 'دور غير صالح.' });
         fields.push('role = ?'); params.push(role);
     }
-    if (branch_id !== undefined) { fields.push('branch_id = ?'); params.push(branch_id ? parseInt(branch_id) : null); }
     if (permissions !== undefined) {
         const perms = Array.isArray(permissions) ? permissions : String(permissions || '').split(',');
         fields.push('permissions = ?'); params.push(perms.map(p => p.trim()).filter(Boolean).join(','));
     }
     if (password) { fields.push('password = ?'); params.push(bcrypt.hashSync(password, 10)); }
 
-    if (fields.length === 0) return res.status(400).json({ message: 'لا توجد بيانات للتعديل.' });
+    const runUpdate = () => {
+        if (fields.length === 0) return res.status(400).json({ message: 'لا توجد بيانات للتعديل.' });
+        params.push(userId);
+        db.run(`UPDATE users SET ${fields.join(', ')} WHERE id = ?`, params, function(err) {
+            if (err) return res.status(500).json({ message: 'خطأ أثناء تعديل المستخدم، قد يكون البريد مستخدماً مسبقاً.' });
+            if (this.changes === 0) return res.status(404).json({ message: 'المستخدم غير موجود.' });
+            res.json({ message: '✅ تم تعديل المستخدم والصلاحيات بنجاح!' });
+        });
+    };
 
-    params.push(userId);
-    db.run(`UPDATE users SET ${fields.join(', ')} WHERE id = ?`, params, function(err) {
-        if (err) return res.status(500).json({ message: 'خطأ أثناء تعديل المستخدم، قد يكون البريد مستخدماً مسبقاً.' });
-        if (this.changes === 0) return res.status(404).json({ message: 'المستخدم غير موجود.' });
-        res.json({ message: '✅ تم تعديل المستخدم والصلاحيات بنجاح!' });
-    });
+    if (branch_id !== undefined) {
+        resolveBranchId(branch_id, (err, finalBranch) => {
+            if (err) return res.status(500).json({ message: 'خطأ أثناء التحقق من الفرع' });
+            fields.push('branch_id = ?');
+            params.push(finalBranch);
+            runUpdate();
+        });
+    } else {
+        runUpdate();
+    }
 });
 
 // 4. حذف مستخدم - مدير النظام فقط
@@ -819,14 +839,18 @@ app.post('/api/users', verifyToken, (req, res) => {
     const perms = Array.isArray(permissions) ? permissions.map(p => p.trim()).filter(Boolean).join(',') : '';
     const hashedPassword = bcrypt.hashSync(password, 10);
 
-    db.run(
-        "INSERT INTO users (name, email, password, role, branch_id, permissions) VALUES (?, ?, ?, ?, ?, ?)",
-        [name.trim(), email.trim().toLowerCase(), hashedPassword, userRole, branch_id ? parseInt(branch_id) : null, perms],
-        function(err) {
-            if (err) return res.status(500).json({ message: 'خطأ في إنشاء الحساب، قد يكون البريد الإلكتروني مستخدماً مسبقاً.' });
-            res.json({ message: '✅ تم إنشاء الحساب بنجاح!', id: this.lastID });
-        }
-    );
+    resolveBranchId(branch_id, (err, finalBranch) => {
+        if (err) return res.status(500).json({ message: 'خطأ أثناء التحقق من الفرع' });
+
+        db.run(
+            "INSERT INTO users (name, email, password, role, branch_id, permissions) VALUES (?, ?, ?, ?, ?, ?)",
+            [name.trim(), email.trim().toLowerCase(), hashedPassword, userRole, finalBranch, perms],
+            function(err2) {
+                if (err2) return res.status(500).json({ message: 'خطأ في إنشاء الحساب، قد يكون البريد الإلكتروني مستخدماً مسبقاً.' });
+                res.json({ message: '✅ تم إنشاء الحساب بنجاح!', id: this.lastID });
+            }
+        );
+    });
 });
 
 // 2. إنشاء حصة تدريبية جديدة (المدرب يُؤخذ تلقائياً من الباقة)
