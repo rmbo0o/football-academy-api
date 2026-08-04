@@ -12,7 +12,7 @@ app.use(cors());
 
 const JWT_SECRET = process.env.JWT_SECRET || 'my_super_secret_key_123';
 const PORT = process.env.PORT || 5000;
-const dbPath = path.resolve(__dirname, 'football_academy.db');
+const dbPath = path.resolve(__dirname, process.env.DB_PATH || 'football_academy.db');
 
 const db = new sqlite3.Database(dbPath, (err) => {
     if (err) console.error(err.message);
@@ -133,6 +133,19 @@ function initializeDatabase() {
             // تجاهل الخطأ إذا كان العمود مضافاً مسبقاً
         });
 
+        // ترقية الباقات لربطها بالفرع تلقائياً
+        db.run(`ALTER TABLE packages ADD COLUMN branch_id INTEGER`, (err) => {
+            // تجاهل الخطأ إذا كان العمود مضافاً مسبقاً
+        });
+
+        // ترقية جدول المستخدمين لربطه بالفرع وتخزين الصلاحيات تلقائياً
+        db.run(`ALTER TABLE users ADD COLUMN branch_id INTEGER`, (err) => {
+            // تجاهل الخطأ إذا كان العمود مضافاً مسبقاً
+        });
+        db.run(`ALTER TABLE users ADD COLUMN permissions TEXT`, (err) => {
+            // تجاهل الخطأ إذا كان العمود مضافاً مسبقاً
+        });
+
         db.get("SELECT COUNT(*) as count FROM users", (err, row) => {
             if (row && row.count === 0) {
                 const hashedPassword = bcrypt.hashSync('password', 10);
@@ -171,6 +184,16 @@ function verifyToken(req, res, next) {
     } else { res.status(401).json({ message: 'غير مسموح بالدخول' }); }
 }
 
+// تحديد نطاق الفرع: مدير الفرع مقيد بفرعه دائماً، والمدير العام يختار من الطلب
+function getBranchScope(req) {
+    if (req.user && req.user.role === 'branch_manager') {
+        // مدير فرع بدون فرع مخصص → لا يرى أي بيانات (-1 لا يطابق أي فرع)
+        return req.user.branch_id || -1;
+    }
+    const b = req.query.branch_id ? parseInt(req.query.branch_id) : null;
+    return Number.isInteger(b) ? b : null;
+}
+
 app.get('/api/dashboard/data', verifyToken, (req, res) => {
     res.json({ name: req.user.name, role: req.user.role, secretData: req.user.role === 'admin' ? "🔒 أرباحك 5000$" : "📋 لديك حصتين اليوم" });
 });
@@ -179,13 +202,14 @@ app.post('/api/login', (req, res) => {
     const { email, password } = req.body;
     db.get('SELECT * FROM users WHERE email = ?', [email], async (err, user) => {
         if (!user || !(await bcrypt.compare(password, user.password))) return res.status(401).json({ message: 'بيانات الدخول خاطئة' });
-        const token = jwt.sign({ id: user.id, role: user.role, name: user.name }, JWT_SECRET, { expiresIn: '24h' });
-        res.json({ token });
+        const permissions = (user.permissions || '').split(',').filter(Boolean);
+        const token = jwt.sign({ id: user.id, role: user.role, name: user.name, branch_id: user.branch_id, permissions }, JWT_SECRET, { expiresIn: '24h' });
+        res.json({ token, user: { id: user.id, name: user.name, role: user.role, branch_id: user.branch_id, permissions } });
     });
 });
 
 // تسجيل لاعب جديد وتوليد معرف فريد تلقائياً
-app.post('/api/players', (req, res) => {
+app.post('/api/players', verifyToken, (req, res) => {
     const { 
         name, birth_date, parent_phone, relative_relation, relative_phone, 
         height, weight, allergies, chronic_diseases, past_injuries, current_medications, branch_id 
@@ -207,6 +231,7 @@ app.post('/api/players', (req, res) => {
     };
 
     generateUniqueMemberNumber((finalMemberNumber) => {
+        const branchId = (req.user.role === 'branch_manager') ? (req.user.branch_id || null) : (req.body.branch_id || null);
         const sql = `
             INSERT INTO players (
                 name, birth_date, parent_phone, relative_relation, relative_phone, 
@@ -218,7 +243,7 @@ app.post('/api/players', (req, res) => {
         const params = [
             name, birth_date, parent_phone, relative_relation, relative_phone, 
             finalMemberNumber, height, weight, allergies, chronic_diseases, 
-            past_injuries, current_medications, branch_id || null
+            past_injuries, current_medications, branchId
         ];
 
         db.run(sql, params, function(err) {
@@ -229,7 +254,12 @@ app.post('/api/players', (req, res) => {
 });
 
 app.get('/api/players', verifyToken, (req, res) => {
-    db.all("SELECT id, name, member_number FROM players ORDER BY id DESC", [], (err, rows) => { res.json(rows); });
+    const branchId = getBranchScope(req);
+    if (branchId) {
+        db.all("SELECT id, name, member_number FROM players WHERE branch_id = ? ORDER BY id DESC", [branchId], (err, rows) => { res.json(rows); });
+    } else {
+        db.all("SELECT id, name, member_number FROM players ORDER BY id DESC", [], (err, rows) => { res.json(rows); });
+    }
 });
 
 app.get('/api/players/:id/profile', (req, res) => {
@@ -296,8 +326,9 @@ app.get('/api/sports', verifyToken, (req, res) => {
 });
 
 app.post('/api/packages', verifyToken, (req, res) => {
-    if (req.user.role !== 'admin') return res.status(403).json({ message: 'عذراً، هذه الصلاحية خاصة بالمدير العام فقط!' });
+    if (req.user.role !== 'admin' && req.user.role !== 'branch_manager') return res.status(403).json({ message: 'عذراً، هذه الصلاحية خاصة بالمدير العام أو مدير الفرع فقط!' });
     const { sport_name, name, days, session_time, durations, max_subscribers, coach_id } = req.body;
+    const branchId = (req.user.role === 'branch_manager') ? (req.user.branch_id || null) : (req.body.branch_id || null);
 
     if (!sport_name || !name || !days || !session_time) {
         return res.status(400).json({ message: 'الرجاء التأكد من إدخال كافة البيانات الأساسية' });
@@ -307,8 +338,8 @@ app.post('/api/packages', verifyToken, (req, res) => {
         if (err) return res.status(500).json({ message: 'خطأ في فحص الرياضة' });
 
         const insertPackageAndDurations = (sportId) => {
-            const packageSql = `INSERT INTO packages (sport_id, name, days, session_time, max_subscribers, coach_id) VALUES (?, ?, ?, ?, ?, ?)`;
-            db.run(packageSql, [sportId, name, days, session_time, max_subscribers || 0, coach_id || null], function(err) {
+            const packageSql = `INSERT INTO packages (sport_id, name, days, session_time, max_subscribers, coach_id, branch_id) VALUES (?, ?, ?, ?, ?, ?, ?)`;
+            db.run(packageSql, [sportId, name, days, session_time, max_subscribers || 0, coach_id || null, branchId], function(err) {
                 if (err) return res.status(500).json({ message: 'حدث خطأ أثناء حفظ الباقة الأساسية' });
 
                 const packageId = this.lastID;
@@ -338,6 +369,9 @@ app.post('/api/packages', verifyToken, (req, res) => {
 });
 
 app.get('/api/active-packages', verifyToken, (req, res) => {
+    const branchId = getBranchScope(req);
+    const branchFilter = branchId ? ' AND p.branch_id = ?' : '';
+    const branchParam = branchId ? [branchId] : [];
     const sql = `
         SELECT 
             pd.id AS duration_id, 
@@ -353,9 +387,10 @@ app.get('/api/active-packages', verifyToken, (req, res) => {
         JOIN packages p ON pd.package_id = p.id
         JOIN sports s ON p.sport_id = s.id
         WHERE pd.is_active = 1
+        ${branchFilter}
         ORDER BY s.name, p.name, pd.months
     `;
-    db.all(sql, [], (err, rows) => {
+    db.all(sql, branchParam, (err, rows) => {
         if (err) return res.status(500).json({ message: 'خطأ في جلب الباقات' });
         res.json(rows);
     });
@@ -408,13 +443,17 @@ app.put('/api/subscriptions/:id', verifyToken, (req, res) => {
 
 // جلب قائمة الباقات المتاحة مع تفاصيل الأيام والوقت للتوليد التلقائي للحصص
 app.get('/api/packages-list', verifyToken, (req, res) => {
+    const branchId = getBranchScope(req);
+    const branchFilter = branchId ? ' WHERE p.branch_id = ?' : '';
+    const branchParam = branchId ? [branchId] : [];
     const sql = `
-        SELECT p.id, p.name AS package_name, s.name AS sport_name, p.days, p.session_time, p.max_subscribers, p.coach_id, u.name AS coach_name
+        SELECT p.id, p.name AS package_name, s.name AS sport_name, p.days, p.session_time, p.max_subscribers, p.coach_id, p.branch_id, u.name AS coach_name
         FROM packages p
         JOIN sports s ON p.sport_id = s.id
         LEFT JOIN users u ON p.coach_id = u.id
+        ${branchFilter}
     `;
-    db.all(sql, [], (err, rows) => {
+    db.all(sql, branchParam, (err, rows) => {
         if (err) return res.status(500).json({ message: 'خطأ في جلب قائمة الباقات' });
         res.json(rows);
     });
@@ -441,16 +480,17 @@ app.get('/api/packages/:id', verifyToken, (req, res) => {
 
 // تعديل باقة موجودة
 app.put('/api/packages/:id', verifyToken, (req, res) => {
-    if (req.user.role !== 'admin') return res.status(403).json({ message: 'عذراً، هذه الصلاحية خاصة بالمدير العام فقط!' });
+    if (req.user.role !== 'admin' && req.user.role !== 'branch_manager') return res.status(403).json({ message: 'عذراً، هذه الصلاحية خاصة بالمدير العام أو مدير الفرع فقط!' });
     const packageId = req.params.id;
     const { sport_name, name, days, session_time, max_subscribers, durations, coach_id } = req.body;
+    const branchId = (req.user.role === 'branch_manager') ? (req.user.branch_id || null) : (req.body.branch_id || null);
 
     db.get("SELECT id FROM sports WHERE name = ?", [sport_name.trim()], (err, sportRow) => {
         if (err) return res.status(500).json({ message: 'خطأ في فحص الرياضة' });
 
         const updatePackage = (sportId) => {
-            const sql = `UPDATE packages SET sport_id = ?, name = ?, days = ?, session_time = ?, max_subscribers = ?, coach_id = ? WHERE id = ?`;
-            db.run(sql, [sportId, name, days, session_time, max_subscribers || 0, coach_id || null, packageId], function(err) {
+            const sql = `UPDATE packages SET sport_id = ?, name = ?, days = ?, session_time = ?, max_subscribers = ?, coach_id = ?, branch_id = ? WHERE id = ?`;
+            db.run(sql, [sportId, name, days, session_time, max_subscribers || 0, coach_id || null, branchId, packageId], function(err) {
                 if (err) return res.status(500).json({ message: 'خطأ أثناء تعديل الباقة' });
 
                 if (durations && durations.length > 0) {
@@ -548,6 +588,9 @@ app.get('/api/branches/:id/players', verifyToken, (req, res) => {
 // ملخص بيانات فرع محدد للوحة التحكم
 app.get('/api/branches/:id/summary', verifyToken, (req, res) => {
     const branchId = req.params.id;
+    if (req.user.role === 'branch_manager' && parseInt(branchId) !== req.user.branch_id) {
+        return res.status(403).json({ message: 'غير مصرح بالوصول لبيانات هذا الفرع' });
+    }
     const sql = `
         SELECT 
             (SELECT COUNT(*) FROM players WHERE branch_id = ?) AS total_players,
@@ -594,6 +637,13 @@ app.post('/api/branches', verifyToken, (req, res) => {
 });
 
 app.get('/api/branches', verifyToken, (req, res) => {
+    if (req.user.role === 'branch_manager') {
+        db.all("SELECT * FROM branches WHERE id = ? ORDER BY id DESC", [req.user.branch_id], (err, rows) => {
+            if (err) return res.status(500).json({ message: 'خطأ في جلب الفروع' });
+            res.json(rows);
+        });
+        return;
+    }
     db.all("SELECT * FROM branches ORDER BY id DESC", [], (err, rows) => {
         if (err) return res.status(500).json({ message: 'خطأ في جلب الفروع' });
         res.json(rows);
@@ -618,23 +668,29 @@ app.post('/api/refunds', verifyToken, (req, res) => {
 });
 
 app.get('/api/reports/summary', verifyToken, (req, res) => {
+    const branchId = getBranchScope(req);
     const reportData = { totalIncome: 0, totalRefunds: 0, netIncome: 0, playersPerSport: [], totalPlayers: 0, recentRefundsList: [] };
+
+    const branchCond = branchId ? ' AND p.branch_id = ?' : '';
+    const branchParam = branchId ? [branchId] : [];
 
     const incomeSql = `
         SELECT SUM(pd.price) as total_income 
         FROM subscriptions sub 
         JOIN package_durations pd ON sub.duration_id = pd.id 
-        WHERE strftime('%Y-%m', sub.created_at) = strftime('%Y-%m', 'now')
+        JOIN players p ON sub.player_id = p.id
+        WHERE strftime('%Y-%m', sub.created_at) = strftime('%Y-%m', 'now') ${branchCond}
     `;
-    db.get(incomeSql, [], (err, incomeRow) => {
+    db.get(incomeSql, branchParam, (err, incomeRow) => {
         reportData.totalIncome = (incomeRow && incomeRow.total_income) ? incomeRow.total_income : 0;
 
         const refundSql = `
-            SELECT SUM(amount) as total_refunds 
-            FROM refunds 
-            WHERE strftime('%Y-%m', date) = strftime('%Y-%m', 'now')
+            SELECT SUM(r.amount) as total_refunds 
+            FROM refunds r
+            JOIN players p ON r.player_id = p.id
+            WHERE strftime('%Y-%m', r.date) = strftime('%Y-%m', 'now') ${branchCond}
         `;
-        db.get(refundSql, [], (err, refundRow) => {
+        db.get(refundSql, branchParam, (err, refundRow) => {
             reportData.totalRefunds = (refundRow && refundRow.total_refunds) ? refundRow.total_refunds : 0;
             reportData.netIncome = reportData.totalIncome - reportData.totalRefunds;
 
@@ -644,21 +700,25 @@ app.get('/api/reports/summary', verifyToken, (req, res) => {
                 LEFT JOIN packages p ON s.id = p.sport_id
                 LEFT JOIN package_durations pd ON p.id = pd.package_id
                 LEFT JOIN subscriptions sub ON pd.id = sub.duration_id
+                LEFT JOIN players pl ON sub.player_id = pl.id
+                ${branchId ? 'WHERE pl.branch_id = ?' : ''}
                 GROUP BY s.id
             `;
-            db.all(sportSql, [], (err, sportRows) => {
+            db.all(sportSql, branchParam, (err, sportRows) => {
                 reportData.playersPerSport = sportRows || [];
 
-                db.get("SELECT COUNT(*) as total FROM players", [], (err, playerRow) => {
+                const totalPlayersSql = branchId ? "SELECT COUNT(*) as total FROM players WHERE branch_id = ?" : "SELECT COUNT(*) as total FROM players";
+                db.get(totalPlayersSql, branchParam, (err, playerRow) => {
                     reportData.totalPlayers = (playerRow && playerRow.total) ? playerRow.total : 0;
 
                     const recentRefundsSql = `
                         SELECT r.id, r.amount, r.date, r.reason, p.name as player_name 
                         FROM refunds r
                         JOIN players p ON r.player_id = p.id
+                        ${branchId ? 'WHERE p.branch_id = ?' : ''}
                         ORDER BY r.id DESC LIMIT 10
                     `;
-                    db.all(recentRefundsSql, [], (err, refundRows) => {
+                    db.all(recentRefundsSql, branchParam, (err, refundRows) => {
                         reportData.recentRefundsList = refundRows || [];
                         res.json(reportData);
                     });
@@ -672,32 +732,92 @@ app.get('/api/reports/summary', verifyToken, (req, res) => {
 // ⚽ روابط وجداول الحصص والتمارين الأسبوعية (المؤتمتة والمحدثة)
 // ==========================================
 
-// 1. جلب الكباتن والمدربين فقط
+// 1. جلب الكباتن والمدربين فقط (مرتبط بالفرع المحدد إن وُجد)
 app.get('/api/coaches', verifyToken, (req, res) => {
-    db.all("SELECT id, name, email FROM users WHERE role IN ('coach', 'مدرب')", [], (err, rows) => {
+    const branchId = getBranchScope(req);
+    const branchFilter = branchId ? ' AND branch_id = ?' : '';
+    const branchParam = branchId ? [branchId] : [];
+    db.all(`SELECT id, name, email, branch_id FROM users WHERE role IN ('coach', 'مدرب') ${branchFilter}`, branchParam, (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
         res.json(rows);
     });
 });
 
-// إضافة حساب مدرب جديد (مدير النظام فقط)
+// 2. جلب جميع المستخدمين (إدارة الموظفين والصلاحيات - مدير النظام فقط)
+app.get('/api/users', verifyToken, (req, res) => {
+    if (req.user.role !== 'admin') return res.status(403).json({ message: 'صلاحية خاصة بالمدير العام فقط!' });
+    db.all("SELECT id, name, email, role, branch_id, permissions FROM users ORDER BY id DESC", [], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+    });
+});
+
+// 3. تعديل مستخدم (الاسم/الدور/الصلاحيات/الفرع/كلمة المرور) - مدير النظام فقط
+app.put('/api/users/:id', verifyToken, (req, res) => {
+    if (req.user.role !== 'admin') return res.status(403).json({ message: 'صلاحية خاصة بالمدير العام فقط!' });
+    const userId = req.params.id;
+    const { name, email, password, role, branch_id, permissions } = req.body;
+
+    const fields = [];
+    const params = [];
+
+    if (name !== undefined) { fields.push('name = ?'); params.push(String(name).trim()); }
+    if (email !== undefined) { fields.push('email = ?'); params.push(String(email).trim().toLowerCase()); }
+    if (role !== undefined) {
+        const validRoles = ['admin', 'branch_manager', 'coach', 'employee'];
+        if (!validRoles.includes(role)) return res.status(400).json({ message: 'دور غير صالح.' });
+        fields.push('role = ?'); params.push(role);
+    }
+    if (branch_id !== undefined) { fields.push('branch_id = ?'); params.push(branch_id ? parseInt(branch_id) : null); }
+    if (permissions !== undefined) {
+        const perms = Array.isArray(permissions) ? permissions : String(permissions || '').split(',');
+        fields.push('permissions = ?'); params.push(perms.map(p => p.trim()).filter(Boolean).join(','));
+    }
+    if (password) { fields.push('password = ?'); params.push(bcrypt.hashSync(password, 10)); }
+
+    if (fields.length === 0) return res.status(400).json({ message: 'لا توجد بيانات للتعديل.' });
+
+    params.push(userId);
+    db.run(`UPDATE users SET ${fields.join(', ')} WHERE id = ?`, params, function(err) {
+        if (err) return res.status(500).json({ message: 'خطأ أثناء تعديل المستخدم، قد يكون البريد مستخدماً مسبقاً.' });
+        if (this.changes === 0) return res.status(404).json({ message: 'المستخدم غير موجود.' });
+        res.json({ message: '✅ تم تعديل المستخدم والصلاحيات بنجاح!' });
+    });
+});
+
+// 4. حذف مستخدم - مدير النظام فقط
+app.delete('/api/users/:id', verifyToken, (req, res) => {
+    if (req.user.role !== 'admin') return res.status(403).json({ message: 'صلاحية خاصة بالمدير العام فقط!' });
+    const userId = req.params.id;
+    if (parseInt(userId) === req.user.id) return res.status(400).json({ message: 'لا يمكنك حذف حسابك الحالي!' });
+
+    db.run("DELETE FROM users WHERE id = ?", [userId], function(err) {
+        if (err) return res.status(500).json({ message: 'خطأ أثناء حذف المستخدم.' });
+        if (this.changes === 0) return res.status(404).json({ message: 'المستخدم غير موجود.' });
+        res.json({ message: '✅ تم حذف المستخدم بنجاح!' });
+    });
+});
+
+// إضافة حساب موظف/مدرب/مدير فرع جديد (مدير النظام فقط)
 app.post('/api/users', verifyToken, (req, res) => {
     if (req.user.role !== 'admin') return res.status(403).json({ message: 'صلاحية خاصة بالمدير العام فقط!' });
-    const { name, email, password, role } = req.body;
+    const { name, email, password, role, branch_id, permissions } = req.body;
 
     if (!name || !email || !password) {
         return res.status(400).json({ message: 'الرجاء إدخال الاسم والبريد الإلكتروني وكلمة المرور.' });
     }
 
-    const userRole = (role === 'coach' || role === 'branch_manager') ? role : 'coach';
+    const validRoles = ['admin', 'branch_manager', 'coach', 'employee'];
+    const userRole = validRoles.includes(role) ? role : 'employee';
+    const perms = Array.isArray(permissions) ? permissions.map(p => p.trim()).filter(Boolean).join(',') : '';
     const hashedPassword = bcrypt.hashSync(password, 10);
 
     db.run(
-        "INSERT INTO users (name, email, password, role) VALUES (?, ?, ?, ?)",
-        [name.trim(), email.trim().toLowerCase(), hashedPassword, userRole],
+        "INSERT INTO users (name, email, password, role, branch_id, permissions) VALUES (?, ?, ?, ?, ?, ?)",
+        [name.trim(), email.trim().toLowerCase(), hashedPassword, userRole, branch_id ? parseInt(branch_id) : null, perms],
         function(err) {
             if (err) return res.status(500).json({ message: 'خطأ في إنشاء الحساب، قد يكون البريد الإلكتروني مستخدماً مسبقاً.' });
-            res.json({ message: '✅ تم إنشاء حساب المدرب بنجاح!', id: this.lastID });
+            res.json({ message: '✅ تم إنشاء الحساب بنجاح!', id: this.lastID });
         }
     );
 });
@@ -708,12 +828,14 @@ app.post('/api/sessions', verifyToken, (req, res) => {
     if (!package_id) {
         return res.status(400).json({ message: "يرجى تحديد الباقة." });
     }
-    db.get("SELECT coach_id FROM packages WHERE id = ?", [package_id], (err, pkg) => {
+    db.get("SELECT coach_id, branch_id AS pkg_branch FROM packages WHERE id = ?", [package_id], (err, pkg) => {
         if (err) return res.status(500).json({ error: err.message });
         const coach_id = (pkg && pkg.coach_id) || null;
+        const finalBranch = (req.user.role === 'branch_manager') ? (req.user.branch_id || null)
+                            : (branch_id || (pkg && pkg.pkg_branch) || null);
         db.run(
             "INSERT INTO sessions (package_id, coach_id, branch_id) VALUES (?, ?, ?)", 
-            [package_id, coach_id, branch_id || null], 
+            [package_id, coach_id, finalBranch], 
             function(err2) {
                 if (err2) return res.status(500).json({ error: err2.message });
                 res.json({ message: "تم تسجيل الحصة التدريبية بنجاح! ⚽", sessionId: this.lastID });
@@ -724,6 +846,9 @@ app.post('/api/sessions', verifyToken, (req, res) => {
 
 // 3. جلب جدول الحصص الأسبوعية المؤتمت مع دمج بيانات الباقة وتفكيك الوقت بدقة
 app.get('/api/sessions', verifyToken, (req, res) => {
+    const branchId = getBranchScope(req);
+    const branchFilter = branchId ? ' WHERE s.branch_id = ?' : '';
+    const branchParam = branchId ? [branchId] : [];
     const sql = `
         SELECT 
             s.id AS id,
@@ -746,8 +871,9 @@ app.get('/api/sessions', verifyToken, (req, res) => {
         JOIN packages p ON s.package_id = p.id
         JOIN sports sp ON p.sport_id = sp.id
         LEFT JOIN users u ON s.coach_id = u.id
+        ${branchFilter}
     `;
-    db.all(sql, [], (err, rows) => {
+    db.all(sql, branchParam, (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
         
         // تفكيك تيار الوقت (مثل "17:00 - 18:30") لتأمين التوافق مع قوالب العرض القديمة والجديدة
@@ -822,11 +948,20 @@ app.post('/api/sessions/:id/attendance', verifyToken, (req, res) => {
 // 📌 1. البحث الفوري والشامل عن المشتركين بالاسم أو رقم العضوية
 app.get('/api/players/search', verifyToken, (req, res) => {
   const { q } = req.query;
-  let sql = 'SELECT * FROM players WHERE name LIKE ? OR member_number LIKE ?';
-  db.all(sql, [`%${q}%`, `%${q}%`], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
-  });
+  const branchId = getBranchScope(req);
+  if (branchId) {
+    let sql = 'SELECT * FROM players WHERE (name LIKE ? OR member_number LIKE ?) AND branch_id = ?';
+    db.all(sql, [`%${q}%`, `%${q}%`, branchId], (err, rows) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json(rows);
+    });
+  } else {
+    let sql = 'SELECT * FROM players WHERE name LIKE ? OR member_number LIKE ?';
+    db.all(sql, [`%${q}%`, `%${q}%`], (err, rows) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json(rows);
+    });
+  }
 });
 
 // 📌 6. تسجيل العطلات الرسمية وتمديد الاشتراكات النشطة تلقائياً
