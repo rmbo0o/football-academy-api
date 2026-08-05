@@ -267,6 +267,19 @@ app.get('/api/players', verifyToken, (req, res) => {
     }
 });
 
+// آخر المشتركين المسجلين (حسب الفرع المحدد إن وُجد) للوحة التحكم
+app.get('/api/players/recent', verifyToken, (req, res) => {
+    const branchId = getBranchScope(req);
+    let limit = parseInt(req.query.limit) || 10;
+    if (limit < 1) limit = 10;
+    if (limit > 50) limit = 50;
+    if (branchId) {
+        db.all("SELECT id, name, member_number, created_at FROM players WHERE branch_id = ? ORDER BY id DESC LIMIT " + limit, [branchId], (err, rows) => { if (err) return res.status(500).json({ error: err.message }); res.json(rows || []); });
+    } else {
+        db.all("SELECT id, name, member_number, created_at FROM players ORDER BY id DESC LIMIT " + limit, [], (err, rows) => { if (err) return res.status(500).json({ error: err.message }); res.json(rows || []); });
+    }
+});
+
 app.get('/api/players/:id/profile', (req, res) => {
     const playerId = req.params.id;
     db.get("SELECT * FROM players WHERE id = ?", [playerId], (err, player) => {
@@ -860,11 +873,11 @@ app.post('/api/sessions', verifyToken, (req, res) => {
         return res.status(400).json({ message: "يرجى تحديد الباقة." });
     }
     // منع التكرار: الباقة لا تُضاف حصتها أكثر من مرة
-    db.get("SELECT id FROM sessions WHERE package_id = ?", [package_id], (err, existing) => {
-        if (err) return res.status(500).json({ error: err.message });
-        if (existing) {
-            return res.status(400).json({ message: 'هذه الباقة لديها حصة مسجلة مسبقاً في جدول الحصص.' });
-        }
+        db.get("SELECT id FROM sessions WHERE package_id = ?", [package_id], (err, existing) => {
+            if (err) return res.status(500).json({ error: err.message });
+            if (existing) {
+                return res.json({ message: 'هذه الحصة مفعلة مسبقاً في الجدول الأسبوعي.', sessionId: existing.id });
+            }
         db.get("SELECT coach_id, branch_id AS pkg_branch FROM packages WHERE id = ?", [package_id], (err, pkg) => {
             if (err) return res.status(500).json({ error: err.message });
             const coach_id = (pkg && pkg.coach_id) || null;
@@ -956,6 +969,7 @@ function ensureCoachSessionAccess(req, res, next) {
 
 app.get('/api/sessions/:id/players', verifyToken, ensureCoachSessionAccess, (req, res) => {
     const sessionId = req.params.id;
+    const date = req.query.date || new Date().toISOString().split('T')[0];
     const sql = `
         SELECT DISTINCT pl.id, pl.name, pl.member_number
         FROM players pl
@@ -963,10 +977,15 @@ app.get('/api/sessions/:id/players', verifyToken, ensureCoachSessionAccess, (req
         JOIN package_durations pd ON sub.duration_id = pd.id
         JOIN sessions s ON pd.package_id = s.package_id
         WHERE s.id = ?
+          AND sub.start_date <= ? AND sub.end_date >= ?
+          AND NOT EXISTS (
+              SELECT 1 FROM session_attendance sa
+              WHERE sa.session_id = s.id AND sa.player_id = pl.id AND sa.date = ?
+          )
     `;
-    db.all(sql, [sessionId], (err, rows) => {
+    db.all(sql, [sessionId, date, date, date], (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
-        res.json(rows);
+        res.json(rows || []);
     });
 });
 
@@ -974,9 +993,16 @@ app.get('/api/sessions/:id/players', verifyToken, ensureCoachSessionAccess, (req
 app.get('/api/sessions/:id/attendance', verifyToken, ensureCoachSessionAccess, (req, res) => {
     const sessionId = req.params.id;
     const { date } = req.query; 
-    db.all("SELECT player_id, status FROM session_attendance WHERE session_id = ? AND date = ?", [sessionId, date], (err, rows) => {
+    const sql = `
+        SELECT sa.player_id, sa.status, pl.name, pl.member_number
+        FROM session_attendance sa
+        JOIN players pl ON sa.player_id = pl.id
+        WHERE sa.session_id = ? AND sa.date = ?
+        ORDER BY sa.id ASC
+    `;
+    db.all(sql, [sessionId, date], (err, rows) => {
         if (err) return res.status(500).json({ error: err.message });
-        res.json(rows);
+        res.json(rows || []);
     });
 });
 
